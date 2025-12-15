@@ -9,8 +9,6 @@ from insightface.app import FaceAnalysis
 import numpy as np
 from dotenv import load_dotenv
 import os
-from deepface import DeepFace
-import cv2
 
 from type import Pose
 from utils import (
@@ -153,58 +151,90 @@ async def verify_person(userId: str = Form(...), comparedImg: UploadFile = Form(
 
     # convert to array
     decodedImg = convert_image_to_np_array(comparedImg)
-    
-    # Anti-spoofing check using DeepFace
+
+    # Anti-spoofing and face validation using insightface
     try:
-        faces = DeepFace.extract_faces(img_path=decodedImg, anti_spoofing=True)
-        
-        if not faces or len(faces) == 0:
+        # Detect faces with insightface
+        detected_faces = rec_model.get(decodedImg)
+
+        print(f"Number of faces detected: {len(detected_faces)}")
+
+        # Check if no face detected
+        if len(detected_faces) == 0:
             return JSONResponse(
                 status_code=HTTPStatus.NOT_FOUND,
                 content={"message": "Không tìm thấy khuôn mặt!"},
             )
-        
+
         # Check for multiple faces
-        if len(faces) > 1:
+        if len(detected_faces) > 1:
             return JSONResponse(
                 status_code=HTTPStatus.CONFLICT,
                 content={"message": "Không thể có nhiều hơn 1 khuôn mặt!"},
             )
-        
-        face = faces[0]
-        
-        # Check if face is real (anti-spoofing)
-        if not face.get("is_real", False):
+
+        face = detected_faces[0]
+
+        # Get face bounding box
+        bbox = face.bbox.astype(int)
+        x1, y1, x2, y2 = bbox
+        face_width = x2 - x1
+        face_height = y2 - y1
+
+        img_h, img_w = decodedImg.shape[:2]
+
+        # Anti-spoofing Check 1: Face should not be too close (occupying too much of the image)
+        face_ratio = face_width / img_w
+
+        # Anti-spoofing Check 3: Detection score (confidence) - insightface provides det_score
+        det_score = face.det_score if hasattr(face, "det_score") else 1.0
+        print(f"Detection confidence: {det_score}")
+
+        if det_score < 0.8:  # Low confidence detection - possible spoof
             return JSONResponse(
                 status_code=HTTPStatus.CONFLICT,
-                content={"message": "Phát hiện khuôn mặt giả mạo! Vui lòng sử dụng khuôn mặt thật."},
+                content={
+                    "message": "Phát hiện khuôn mặt giả mạo! Vui lòng sử dụng khuôn mặt thật để chấm công"
+                },
             )
-        
-        # Additional check: face should not be too close (occupying too much of the image)
-        img_h, img_w = decodedImg.shape[:2]
-        facial_area = face.get("facial_area", {})
-        if facial_area:
-            face_width = facial_area.get("w", 0)
-            face_ratio = face_width / img_w
-            
-            if face_ratio > 0.45:  # Face covers >45% of image width
-                return JSONResponse(
-                    status_code=HTTPStatus.CONFLICT,
-                    content={"message": "Khuôn mặt quá gần camera! Vui lòng đứng xa hơn."},
-                )
-    
+
+        print(
+            f"Anti-spoofing checks passed - confidence: {det_score}, face_ratio: {face_ratio:.2f}"
+        )
+        if face_ratio > 0.7:  # Face covers >70% of image width
+            return JSONResponse(
+                status_code=HTTPStatus.CONFLICT,
+                content={"message": "Khuôn mặt quá gần camera! Vui lòng đứng xa hơn."},
+            )
+
+        # Anti-spoofing Check 2: Face should not be too small (likely a spoof or low quality)
+        if face_ratio < 0.15:  # Face is less than 15% of image width
+            return JSONResponse(
+                status_code=HTTPStatus.CONFLICT,
+                content={
+                    "message": "Khuôn mặt quá xa hoặc quá nhỏ! Vui lòng đến gần hơn."
+                },
+            )
+
     except Exception as e:
-        print(f"Anti-spoofing error: {e}")
+        print(f"Face validation error: {e}")
         return JSONResponse(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             content={"message": f"Lỗi kiểm tra khuôn mặt: {str(e)}"},
         )
-    
-    # Proceed with face recognition using insightface
-    compared_face = rec_model.get(decodedImg)
 
-    if len(compared_face) > 0:
-        compared_face_embedding = compared_face[0].normed_embedding
+    # Proceed with face recognition using insightface
+    compared_face = detected_faces[0]
+
+    if compared_face is not None:
+        compared_face_embedding = compared_face.normed_embedding
+
+        # Check if user has any registered faces
+        if not face_vector_list or len(face_vector_list) == 0:
+            return JSONResponse(
+                status_code=HTTPStatus.NOT_FOUND,
+                content={"message": "Người dùng chưa đăng ký khuôn mặt!"},
+            )
 
         # Compute similarity (cosine distance) to all target embeddings
         similarities = [
